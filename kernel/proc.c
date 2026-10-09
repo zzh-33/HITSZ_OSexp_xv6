@@ -332,11 +332,26 @@ void exit(int status) {
   struct proc *original_parent = p->parent;
   release(&p->lock);
 
+  static char *states[] = {
+      [UNUSED] "unused", [SLEEPING] "sleep", [RUNNABLE] "runble", [RUNNING] "run", [ZOMBIE] "zombie"};
+
   // we need the parent's lock in order to wake it up from wait().
   // the parent-then-child rule says we have to lock it first.
   acquire(&original_parent->lock);
 
   acquire(&p->lock);
+
+  exit_info("proc %d exit, parent pid %d, name %s, state %s\n", p->pid, original_parent->pid, original_parent->name, states[original_parent->state]);
+
+  int child_num = 0;
+  for (struct proc *pp = proc; pp < &proc[NPROC]; pp++) {
+    if (pp->parent == p) {
+      acquire(&pp->lock);
+      exit_info("proc %d exit, child %d, pid %d, name %s, state %s\n", p->pid, child_num, pp->pid, pp->name, states[pp->state]);
+      release(&pp->lock);
+      child_num++;
+    }
+  }
 
   // Give any children to init.
   reparent(p);
@@ -356,7 +371,7 @@ void exit(int status) {
 
 // Wait for a child process to exit and return its pid.
 // Return -1 if this process has no children.
-int wait(uint64 addr) {
+int wait(uint64 addr, int flag) {
   struct proc *np;
   int havekids, pid;
   struct proc *p = myproc();
@@ -396,6 +411,11 @@ int wait(uint64 addr) {
 
     // No point waiting if we don't have any children.
     if (!havekids || p->killed) {
+      release(&p->lock);
+      return -1;
+    }
+
+    if (flag) {
       release(&p->lock);
       return -1;
     }
