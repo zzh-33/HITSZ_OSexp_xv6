@@ -45,6 +45,39 @@ void kvminit() {
   kvmmap(TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
 }
 
+// 进程内核页表初始化
+pagetable_t ukvminit() {
+
+  // 分配一页内存
+  pagetable_t pagetable;
+  pagetable = (pagetable_t)kalloc();
+
+  if (pagetable == 0) return 0;
+
+  memset(pagetable, 0, PGSIZE);
+
+  // uart registers
+  ukvmmap(pagetable, UART0, UART0, PGSIZE, PTE_R | PTE_W);
+
+  // virtio mmio disk interface
+  ukvmmap(pagetable, VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
+
+  // PLIC
+  ukvmmap(pagetable, PLIC, PLIC, 0x400000, PTE_R | PTE_W);
+
+  // map kernel text executable and read-only.
+  ukvmmap(pagetable, KERNBASE, KERNBASE, (uint64)etext - KERNBASE, PTE_R | PTE_X);
+
+  // map kernel data and the physical RAM we'll make use of.
+  ukvmmap(pagetable, (uint64)etext, (uint64)etext, PHYSTOP - (uint64)etext, PTE_R | PTE_W);
+
+  // map the trampoline for trap entry/exit to
+  // the highest virtual address in the kernel.
+  ukvmmap(pagetable, TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
+
+  return pagetable;
+}
+
 // Switch h/w page table register to the kernel's page table,
 // and enable paging.
 void kvminithart() {
@@ -102,6 +135,11 @@ uint64 walkaddr(pagetable_t pagetable, uint64 va) {
 // does not flush TLB or enable paging.
 void kvmmap(uint64 va, uint64 pa, uint64 sz, int perm) {
   if (mappages(kernel_pagetable, va, sz, pa, perm) != 0) panic("kvmmap");
+}
+
+// 进程内核页表映射
+void ukvmmap(pagetable_t pagetable, uint64 va, uint64 pa, uint64 sz, int perm) {
+  if (mappages(pagetable, va, sz, pa, perm) != 0) panic("ukvmmap");
 }
 
 // translate a kernel virtual address to
@@ -250,6 +288,44 @@ void uvmfree(pagetable_t pagetable, uint64 sz) {
   freewalk(pagetable);
 }
 
+// 递归释放用户内核页表，但不释放叶子项
+static void ukvmfreewalk(pagetable_t pagetable) {
+
+  for (int i = 0; i < 512; i++) {
+
+    pte_t pte = pagetable[i];
+
+    // 对于非叶子项
+    if ((pte & PTE_V) && (pte & (PTE_R | PTE_W | PTE_X)) == 0) {
+      uint64 child = PTE2PA(pte);
+
+      // 递归释放子页表
+      ukvmfreewalk((pagetable_t)child);
+      pagetable[i] = 0;
+
+      // 对于叶子项
+    } else if (pte & PTE_V) {
+      pagetable[i] = 0;
+    }
+  }
+
+  kfree((void *)pagetable);
+}
+
+// 释放用户内核页表，但不释放叶子项
+void ukvmfree(pagetable_t pagetable) {
+
+  // 清空指向用户页表L0的次级页表项
+  if (pagetable[0] & PTE_V) {
+    pagetable_t k_l1 = (pagetable_t)PTE2PA(pagetable[0]);
+    for (int i = 0; i < PX(1, PLIC); i++) {
+      k_l1[i] = 0;
+    }
+  }
+
+  ukvmfreewalk(pagetable);
+}
+
 // Given a parent process's page table, copy
 // its memory into a child's page table.
 // Copies both the page table and the
@@ -316,21 +392,10 @@ int copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len) {
 // Copy len bytes to dst from virtual address srcva in a given page table.
 // Return 0 on success, -1 on error.
 int copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len) {
-  uint64 n, va0, pa0;
-
-  while (len > 0) {
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if (pa0 == 0) return -1;
-    n = PGSIZE - (srcva - va0);
-    if (n > len) n = len;
-    memmove(dst, (void *)(pa0 + (srcva - va0)), n);
-
-    len -= n;
-    dst += n;
-    srcva = va0 + PGSIZE;
-  }
-  return 0;
+    w_sstatus(r_sstatus() | SSTATUS_SUM);
+    int ret = copyin_new(pagetable, dst, srcva, len);
+    w_sstatus(r_sstatus() & ~SSTATUS_SUM);
+    return ret;
 }
 
 // Copy a null-terminated string from user to kernel.
@@ -338,38 +403,10 @@ int copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len) {
 // until a '\0', or max.
 // Return 0 on success, -1 on error.
 int copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max) {
-  uint64 n, va0, pa0;
-  int got_null = 0;
-
-  while (got_null == 0 && max > 0) {
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if (pa0 == 0) return -1;
-    n = PGSIZE - (srcva - va0);
-    if (n > max) n = max;
-
-    char *p = (char *)(pa0 + (srcva - va0));
-    while (n > 0) {
-      if (*p == '\0') {
-        *dst = '\0';
-        got_null = 1;
-        break;
-      } else {
-        *dst = *p;
-      }
-      --n;
-      --max;
-      p++;
-      dst++;
-    }
-
-    srcva = va0 + PGSIZE;
-  }
-  if (got_null) {
-    return 0;
-  } else {
-    return -1;
-  }
+    w_sstatus(r_sstatus() | SSTATUS_SUM);
+    int ret = copyinstr_new(pagetable, dst, srcva, max);
+    w_sstatus(r_sstatus() & ~SSTATUS_SUM);
+    return ret;
 }
 
 // check if use global kpgtbl or not
@@ -378,4 +415,87 @@ int test_pagetable() {
   uint64 gsatp = MAKE_SATP(kernel_pagetable);
   printf("test_pagetable: %d\n", satp != gsatp);
   return satp != gsatp;
+}
+
+// 递归打印页表
+static void vmprintwalk(pagetable_t pagetable, int level, uint64 va_base, int depth) {
+
+  // 遍历当前页表
+  for (int i = 0; i < 512; i++) {
+
+    pte_t pte = pagetable[i];
+
+    // 跳过无效表项
+    if ((pte & PTE_V) == 0) continue;
+
+    // 构建当前虚拟地址
+    uint64 va = va_base | ((uint64)i << PXSHIFT(level));
+
+    // 构建缩进字段
+    char indent[32];
+    int n = 0;
+    for (int j = 0; j < depth; j++) {
+      indent[n++] = '|';
+      indent[n++] = '|';
+      indent[n++] = ' ';
+      indent[n++] = ' ';
+      indent[n++] = ' ';
+    }
+    indent[n++] = '|';
+    indent[n++] = '|';
+    indent[n++] = '\0';
+
+    // 构建flags字符串
+    char flages[5];
+    int m = 0;
+    flages[m++] = pte & PTE_R ? 'r' : '-';
+    flages[m++] = pte & PTE_W ? 'w' : '-';
+    flages[m++] = pte & PTE_X ? 'x' : '-';
+    flages[m++] = pte & PTE_U ? 'u' : '-';
+    flages[m++] = '\0';
+
+    // 分别打印非叶结点和叶结点
+    if ((pte & PTE_V) && (pte & (PTE_R | PTE_W | PTE_X)) == 0) {
+
+      // 非叶结点
+      printf("%sidx: %d: pa: %p, flags: %s\n", indent, i, PTE2PA(pte), flages);
+
+      // 递归打印下一级页表
+      vmprintwalk((pagetable_t)PTE2PA(pte), level - 1, va, depth + 1);
+    } else {
+      // 叶结点
+      printf("%sidx: %d: va: %p -> pa: %p, flags: %s\n", indent, i, (void*)va, PTE2PA(pte), flages);
+    }
+  }
+}
+
+// 打印页表
+void vmprint(pagetable_t pagetable) {
+  printf("page table %p\n", pagetable);
+  vmprintwalk(pagetable, 2, 0, 0);
+}
+
+// 同步用户页表与内核页表
+void sync_pagetable(pagetable_t k_pagetable, pagetable_t u_pagetable) {
+  
+  // 取内核L2页表第0项
+  pagetable_t k_l1 = (pagetable_t)PTE2PA(k_pagetable[0]);
+
+  // 若用户L2页表第0项不存在
+  if ((u_pagetable[0] & PTE_V) == 0) {
+
+    // 内核页表对应映射位置置0
+    for (int i = 0; i < PX(1, PLIC); i++) {
+      k_l1[i] = 0;
+    }
+    return;
+  }
+
+  // 取用户L2页表第0项
+  pagetable_t u_l1 = (pagetable_t)PTE2PA(u_pagetable[0]);
+
+  // 复制用户L1页表的对应项到内核L1页表
+  for (int i = 0; i < PX(1, PLIC); i++) {
+    k_l1[i] = u_l1[i];
+  }
 }
